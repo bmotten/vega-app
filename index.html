@@ -242,7 +242,8 @@
 // ╔══════════════════════════════════════════════════════╗
 // ║  V.E.G.A. — Connected to Railway Backend             ║
 // ╚══════════════════════════════════════════════════════╝
-const BACKEND_URL = "https://vega-backend-production-b752.up.railway.app";
+const BACKEND_URL    = "https://vega-backend-production-b752.up.railway.app";
+const GOOGLE_TTS_KEY = "AIzaSyBgrNdcDxhAP3lwY-m4SyvopiBkSinYQ0I";
 
 // ── STATE ────────────────────────────────────────────────
 let history      = [];
@@ -425,7 +426,13 @@ function startListening(){
   recognition=new SR();
   recognition.lang='en-US'; recognition.continuous=false; recognition.interimResults=false;
   recognition.onstart=async()=>{ setMode('listening'); showResp('Listening...',false); await startMic(); };
-  recognition.onresult=e=>{ recognition.stop(); stopMic(); callVega(e.results[0][0].transcript); };
+  recognition.onresult=e=>{
+    const transcript = e.results[0][0].transcript;
+    recognition.stop();
+    stopMic();
+    showResp(transcript, false);
+    callVega(transcript);
+  };
   recognition.onend=()=>{ stopMic(); if(mode==='listening'){ setMode('idle'); showResp('Awaiting your command.',false); } };
   recognition.onerror=e=>{ stopMic(); setMode('idle'); if(e.error!=='no-speech') showResp('Voice error — try again or type below.',false); };
   recognition.start();
@@ -464,21 +471,28 @@ async function callVega(text){
 }
 
 // ── SPEECH SYNTHESIS ─────────────────────────────────────
-function speakReply(text){
-  if(!window.speechSynthesis){ setMode('idle'); return; }
-  speechSynthesis.cancel();
-  setMode('speaking');
-  const utt=new SpeechSynthesisUtterance(text);
-  utt.rate=.92; utt.pitch=.86; utt.volume=1;
-  const voices=speechSynthesis.getVoices();
-  const pref=voices.find(v=>v.lang==='en-GB'&&/male/i.test(v.name))
-    ||voices.find(v=>v.lang==='en-GB')
-    ||voices.find(v=>/daniel|george|oliver/i.test(v.name))
-    ||voices.find(v=>v.lang.startsWith('en'));
-  if(pref) utt.voice=pref;
-  utt.onend=()=>setMode('idle');
-  utt.onerror=()=>setMode('idle');
-  speechSynthesis.speak(utt);
+async function speakReply(text){
+  try {
+    setMode('speaking');
+    const body = {
+      input: { text: text },
+      voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-D', ssmlGender: 'MALE' },
+      audioConfig: { audioEncoding: 'MP3', speakingRate: 0.92, pitch: -2 }
+    };
+    const res = await fetch(
+      'https://texttospeech.googleapis.com/v1/text:synthesize?key=' + GOOGLE_TTS_KEY,
+      { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }
+    );
+    const data = await res.json();
+    if(data.error){ throw new Error(data.error.message); }
+    const audio = new Audio('data:audio/mp3;base64,' + data.audioContent);
+    audio.onended = () => setMode('idle');
+    audio.onerror = () => setMode('idle');
+    await audio.play();
+  } catch(e){
+    console.error('TTS error:', e);
+    setMode('idle');
+  }
 }
 
 // ── DRAWER ───────────────────────────────────────────────
