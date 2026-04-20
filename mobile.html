@@ -107,13 +107,15 @@ html, body { height: 100%; width: 100%; background: var(--bg); color: var(--p); 
 
 <script>
 const BACKEND_URL = "https://vega-backend-production-b752.up.railway.app";
-const GEMINI_KEY  = "AIzaSyBhSfEXGhV_0zPtTV-LVXWiuSJIHe3uNkM";
+const GOOGLE_STT_KEY = "AIzaSyBgrNdcDxhAP3lwY-m4SyvopiBkSinYQ0I";
 
 let history    = [];
 let mode       = 'idle';
 let drawerOpen = false;
 let mediaRecorder = null;
 let audioChunks   = [];
+let wakeRecognition = null;
+let wakeActive = false;
 let ampData = new Float32Array(72).fill(0);
 let targetAmp = new Float32Array(72).fill(0);
 let rotAngle = 0;
@@ -229,6 +231,10 @@ function setAgent(txt){
 }
 
 // ── MEDIARECORDER VOICE ───────────────────────────────────
+const SILENCE_THRESHOLD = 15;   // audio level below this = silence
+const SILENCE_TIMEOUT   = 1800; // ms of silence before auto-send
+const MAX_RECORD_TIME   = 12000; // max recording ms before force-send
+
 function getSupportedMimeType(){
   const types=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4',''];
   for(const t of types){ if(!t || MediaRecorder.isTypeSupported(t)) return t; }
@@ -236,21 +242,85 @@ function getSupportedMimeType(){
 }
 
 async function startRecording(){
+  stopWakeWord();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio:true,video:false});
     audioChunks = [];
+
+    // ── Silence detection via AudioContext analyser ──
+    const audioCtx   = new (window.AudioContext||window.webkitAudioContext)();
+    const source     = audioCtx.createMediaStreamSource(stream);
+    const analyser   = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const dataArray  = new Uint8Array(analyser.frequencyBinCount);
+
+    let silenceStart  = null;
+    let hasSpoken     = false;
+    let silenceTimer  = null;
+    let maxTimer      = null;
+    let watching      = true;
+
+    function checkSilence(){
+      if(!watching) return;
+      analyser.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a,b)=>a+b,0) / dataArray.length;
+
+      // Debug: show audio level
+      document.getElementById('agent-badge').textContent = 'level: '+Math.round(avg);
+
+      if(avg > SILENCE_THRESHOLD){
+        hasSpoken    = true;
+        silenceStart = null;
+        updateSilenceBar(avg);
+      } else if(hasSpoken){
+        if(!silenceStart) silenceStart = Date.now();
+        const silentFor = Date.now() - silenceStart;
+        const pct = Math.min(100, Math.round(silentFor / SILENCE_TIMEOUT * 100));
+        updateSilenceBar(0, pct);
+        if(silentFor >= SILENCE_TIMEOUT){
+          watching = false;
+          autoStopRecording(stream, audioCtx);
+          return;
+        }
+      }
+      requestAnimationFrame(checkSilence);
+    }
+
+    // Max recording safety cutoff
+    maxTimer = setTimeout(()=>{
+      if(watching){ watching=false; autoStopRecording(stream, audioCtx); }
+    }, MAX_RECORD_TIME);
+
     const mimeType = getSupportedMimeType();
     mediaRecorder = mimeType
       ? new MediaRecorder(stream, {mimeType})
       : new MediaRecorder(stream);
     mediaRecorder.ondataavailable = e => { if(e.data && e.data.size>0) audioChunks.push(e.data); };
-    mediaRecorder.onstop = () => { stream.getTracks().forEach(t=>t.stop()); transcribeAudio(); };
+    mediaRecorder.onstop = () => {
+      clearTimeout(maxTimer);
+      stream.getTracks().forEach(t=>t.stop());
+      audioCtx.close().catch(()=>{});
+      hideSilenceBar();
+      transcribeAudio();
+    };
     mediaRecorder.start(100);
     setMode('listening');
-    showResp('Listening — tap mic again when done', false);
+    showResp('Listening...', false);
+    requestAnimationFrame(checkSilence);
+
   } catch(e) {
     setMode('idle');
     showResp('Mic error: '+e.message, false);
+    setTimeout(startWakeWord, 1000);
+  }
+}
+
+function autoStopRecording(stream, audioCtx){
+  if(mediaRecorder && mediaRecorder.state!=='inactive'){
+    setMode('thinking');
+    showResp('Processing...', false);
+    mediaRecorder.stop();
   }
 }
 
@@ -262,34 +332,79 @@ function stopRecording(){
   }
 }
 
+// ── SILENCE BAR UI ───────────────────────────────────────
+function updateSilenceBar(level, silencePct){
+  let bar = document.getElementById('silence-bar');
+  if(!bar){
+    bar = document.createElement('div');
+    bar.id = 'silence-bar';
+    bar.style.cssText = 'position:absolute;bottom:0;left:0;height:3px;border-radius:2px;transition:width .1s;background:#64dcff;width:0%;';
+    document.getElementById('vis-wrap').style.position='relative';
+    document.getElementById('vis-wrap').appendChild(bar);
+  }
+  if(silencePct !== undefined){
+    bar.style.background = '#b388ff';
+    bar.style.width = (100 - silencePct) + '%';
+  } else {
+    bar.style.background = '#64dcff';
+    bar.style.width = Math.min(100, level * 1.5) + '%';
+  }
+}
+
+function hideSilenceBar(){
+  const bar = document.getElementById('silence-bar');
+  if(bar) bar.style.width = '0%';
+}
+
 async function transcribeAudio(){
   try {
     if(!audioChunks.length){ setMode('idle'); showResp('No audio captured — try again.',false); return; }
+
     const mimeType = mediaRecorder.mimeType || 'audio/webm';
     const blob = new Blob(audioChunks, {type: mimeType});
+    showResp('Captured '+Math.round(blob.size/1024)+'kb — transcribing...', false);
+
     const base64 = await blobToBase64(blob);
+
+    // Map mime type to Google STT encoding
+    let encoding = 'WEBM_OPUS';
+    if(mimeType.includes('ogg')) encoding = 'OGG_OPUS';
+    else if(mimeType.includes('mp4')) encoding = 'MP3';
+
     const body = {
-      contents:[{parts:[
-        {text:'Transcribe this audio. Return only the spoken words, nothing else.'},
-        {inline_data:{mime_type: mimeType, data: base64}}
-      ]}]
+      config: {
+        encoding: encoding,
+        sampleRateHertz: 48000,
+        languageCode: 'en-US',
+        model: 'latest_short',
+        useEnhanced: true
+      },
+      audio: { content: base64 }
     };
+
     const res = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key='+GEMINI_KEY,
+      'https://speech.googleapis.com/v1/speech:recognize?key='+GOOGLE_STT_KEY,
       {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}
     );
     const data = await res.json();
-    const transcript = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if(transcript && transcript.length>0){
+
+    if(data.error){
+      setMode('idle');
+      showResp('STT error: '+data.error.message, false);
+      return;
+    }
+
+    const transcript = data?.results?.[0]?.alternatives?.[0]?.transcript?.trim();
+    if(transcript && transcript.length > 0){
       showResp(transcript, false);
       callVega(transcript);
     } else {
       setMode('idle');
-      showResp('Could not understand — try again or type below.', false);
+      showResp('No speech detected — tap mic and try again.', false);
     }
   } catch(e) {
     setMode('idle');
-    showResp('Transcription error — try typing below.', false);
+    showResp('Transcription error: '+e.message, false);
     console.error(e);
   }
 }
@@ -302,6 +417,102 @@ function blobToBase64(blob){
     reader.readAsDataURL(blob);
   });
 }
+
+// ── WAKE WORD ────────────────────────────────────────────
+function startWakeWord(){
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR || wakeActive) return;
+
+  wakeRecognition = new SR();
+  wakeRecognition.lang = 'en-US';
+  wakeRecognition.continuous = true;
+  wakeRecognition.interimResults = true;
+  wakeRecognition.maxAlternatives = 1;
+
+  wakeRecognition.onstart = () => {
+    wakeActive = true;
+    document.getElementById('slbl').textContent = 'LISTENING';
+  };
+
+  wakeRecognition.onresult = e => {
+    const heard = Array.from(e.results)
+      .map(r => r[0].transcript.toLowerCase())
+      .join(' ');
+
+    // Show what was heard for debugging
+    showResp('Heard: "' + heard.trim() + '"', false);
+
+    if(heard.includes('hey vega') || heard.includes('hey vegas') ||
+       heard.includes('a vega') || heard.includes('aveda') ||
+       heard.includes('vega') || heard.includes('bega') || heard.includes('mega')){
+      wakeRecognition.stop();
+      wakeActive = false;
+      pulseWake();
+      setTimeout(()=> startRecording(), 600);
+    }
+  };
+
+  wakeRecognition.onend = () => {
+    wakeActive = false;
+    document.getElementById('slbl').textContent = 'ONLINE';
+    if(mode === 'idle'){
+      setTimeout(startWakeWord, 1000);
+    }
+  };
+
+  wakeRecognition.onerror = e => {
+    wakeActive = false;
+    if(e.error !== 'no-speech' && e.error !== 'aborted'){
+      console.log('Wake word error:', e.error);
+    }
+    if(mode === 'idle'){
+      setTimeout(startWakeWord, 2000);
+    }
+  };
+
+  try { wakeRecognition.start(); } catch(e) { wakeActive = false; }
+}
+
+function stopWakeWord(){
+  if(wakeRecognition){
+    try { wakeRecognition.stop(); } catch(e){}
+  }
+  wakeActive = false;
+}
+
+function pulseWake(){
+  const ring = document.getElementById('core-ring');
+  const bg = document.getElementById('core-bg');
+  ring.style.borderColor = 'rgba(100,220,255,0.95)';
+  bg.style.background = 'rgba(100,220,255,0.2)';
+  showResp('Ready...', false);
+  setTimeout(()=>{
+    ring.style.borderColor = '';
+    bg.style.background = '';
+  }, 800);
+
+  // Speak acknowledgement before recording starts
+  speakAck('Ready');
+}
+
+function speakAck(text){
+  if(!window.speechSynthesis) return;
+  speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate = 1.0;
+  utt.pitch = 0.86;
+  utt.volume = 1;
+  const voices = speechSynthesis.getVoices();
+  const pref = voices.find(v=>v.lang==='en-GB'&&/male/i.test(v.name))
+    || voices.find(v=>v.lang==='en-GB')
+    || voices.find(v=>/daniel|george|oliver/i.test(v.name))
+    || voices.find(v=>v.lang.startsWith('en'));
+  if(pref) utt.voice = pref;
+  speechSynthesis.speak(utt);
+}
+
+// Start wake word as soon as page loads
+window.addEventListener('load', ()=> setTimeout(startWakeWord, 1500));
 
 // ── MIC BUTTON ───────────────────────────────────────────
 document.getElementById('core-btn').addEventListener('click', function(){
@@ -333,25 +544,68 @@ async function callVega(text){
   } catch(e) {
     setMode('idle'); setAgent('');
     showResp('Communication array offline. Check Railway.', false);
+    setTimeout(startWakeWord, 1000);
   }
 }
 
-// ── SPEECH SYNTHESIS ─────────────────────────────────────
-function speakReply(text){
-  if(!window.speechSynthesis){ setMode('idle'); return; }
-  speechSynthesis.cancel();
+// ── SPEECH SYNTHESIS (Google TTS) ────────────────────────
+// Unlock audio context on first user tap
+let audioUnlocked = false;
+let pendingSpeech = null;
+
+document.addEventListener('click', ()=>{
+  if(!audioUnlocked){
+    audioUnlocked = true;
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    ctx.resume().then(()=> ctx.close());
+    if(pendingSpeech){ const t=pendingSpeech; pendingSpeech=null; speakReply(t); }
+  }
+}, {once: false});
+
+async function speakReply(text){
+  if(!audioUnlocked){ pendingSpeech=text; setMode('idle'); setTimeout(startWakeWord,1000); return; }
   setMode('speaking');
-  const utt=new SpeechSynthesisUtterance(text);
-  utt.rate=.92; utt.pitch=.86; utt.volume=1;
-  const voices=speechSynthesis.getVoices();
-  const pref=voices.find(v=>v.lang==='en-GB'&&/male/i.test(v.name))
-    ||voices.find(v=>v.lang==='en-GB')
-    ||voices.find(v=>/daniel|george|oliver/i.test(v.name))
-    ||voices.find(v=>v.lang.startsWith('en'));
-  if(pref) utt.voice=pref;
-  utt.onend=()=>setMode('idle');
-  utt.onerror=()=>setMode('idle');
-  speechSynthesis.speak(utt);
+  try {
+    const body = {
+      input: { text: text },
+      voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-D', ssmlGender: 'MALE' },
+      audioConfig: { audioEncoding: 'MP3', speakingRate: 0.92, pitch: -2 }
+    };
+    const res = await fetch(
+      'https://texttospeech.googleapis.com/v1/text:synthesize?key='+GOOGLE_STT_KEY,
+      { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }
+    );
+    const data = await res.json();
+    if(data.error){ throw new Error(data.error.message); }
+    const audio = new Audio('data:audio/mp3;base64,'+data.audioContent);
+    audio.onended = ()=>{ setMode('idle'); setTimeout(startWakeWord, 1000); };
+    audio.onerror = ()=>{ setMode('idle'); setTimeout(startWakeWord, 1000); };
+    await audio.play();
+  } catch(e) {
+    console.error('TTS error:', e);
+    setMode('idle');
+    setTimeout(startWakeWord, 1000);
+  }
+}
+
+async function speakAck(text){
+  if(!audioUnlocked) return;
+  try {
+    const body = {
+      input: { text: text },
+      voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-D', ssmlGender: 'MALE' },
+      audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0, pitch: -2 }
+    };
+    const res = await fetch(
+      'https://texttospeech.googleapis.com/v1/text:synthesize?key='+GOOGLE_STT_KEY,
+      { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }
+    );
+    const data = await res.json();
+    if(data.audioContent){
+      const audio = new Audio('data:audio/mp3;base64,'+data.audioContent);
+      await audio.play();
+    }
+  } catch(e) { console.error('Ack TTS error:', e); }
 }
 
 // ── DRAWER ───────────────────────────────────────────────
