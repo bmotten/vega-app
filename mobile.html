@@ -107,8 +107,6 @@ html, body { height: 100%; width: 100%; background: var(--bg); color: var(--p); 
 
 <script>
 const BACKEND_URL = "https://vega-backend-production-b752.up.railway.app";
-const GOOGLE_STT_KEY = "AIzaSyBgrNdcDxhAP3lwY-m4SyvopiBkSinYQ0I";
-
 let history    = [];
 let mode       = 'idle';
 let drawerOpen = false;
@@ -366,35 +364,20 @@ async function transcribeAudio(){
 
     const base64 = await blobToBase64(blob);
 
-    // Map mime type to Google STT encoding
-    let encoding = 'WEBM_OPUS';
-    if(mimeType.includes('ogg')) encoding = 'OGG_OPUS';
-    else if(mimeType.includes('mp4')) encoding = 'MP3';
-
-    const body = {
-      config: {
-        encoding: encoding,
-        sampleRateHertz: 48000,
-        languageCode: 'en-US',
-        model: 'latest_short',
-        useEnhanced: true
-      },
-      audio: { content: base64 }
-    };
-
-    const res = await fetch(
-      'https://speech.googleapis.com/v1/speech:recognize?key='+GOOGLE_STT_KEY,
-      {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}
-    );
+    const res = await fetch(BACKEND_URL + '/transcribe', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ audio: base64, mimeType: mimeType })
+    });
     const data = await res.json();
 
-    if(data.error){
+    if(data.detail || data.error){
       setMode('idle');
-      showResp('STT error: '+data.error.message, false);
+      showResp('STT error: '+(data.detail || data.error), false);
       return;
     }
 
-    const transcript = data?.results?.[0]?.alternatives?.[0]?.transcript?.trim();
+    const transcript = data?.transcript?.trim();
     if(transcript && transcript.length > 0){
       showResp(transcript, false);
       callVega(transcript);
@@ -495,12 +478,28 @@ function pulseWake(){
   speakAck('Ready');
 }
 
+function speakAck(text){
+  if(!window.speechSynthesis) return;
+  speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate = 1.0;
+  utt.pitch = 0.86;
+  utt.volume = 1;
+  const voices = speechSynthesis.getVoices();
+  const pref = voices.find(v=>v.lang==='en-GB'&&/male/i.test(v.name))
+    || voices.find(v=>v.lang==='en-GB')
+    || voices.find(v=>/daniel|george|oliver/i.test(v.name))
+    || voices.find(v=>v.lang.startsWith('en'));
+  if(pref) utt.voice = pref;
+  speechSynthesis.speak(utt);
+}
+
 // Start wake word as soon as page loads
 window.addEventListener('load', ()=> setTimeout(startWakeWord, 1500));
 
 // ── MIC BUTTON ───────────────────────────────────────────
 document.getElementById('core-btn').addEventListener('click', function(){
-  if(mode==='speaking'){ setMode('idle'); return; }
+  if(mode==='speaking'){ speechSynthesis.cancel(); setMode('idle'); return; }
   if(mode==='thinking') return;
   if(mode==='listening'){ stopRecording(); return; }
   startRecording();
@@ -537,37 +536,27 @@ async function callVega(text){
 let audioUnlocked = false;
 let pendingSpeech = null;
 
-function unlockAudio(){
-  if(audioUnlocked) return;
-  audioUnlocked = true;
-  const ctx = new (window.AudioContext||window.webkitAudioContext)();
-  ctx.resume().then(()=> ctx.close()).catch(()=>{});
-  // Play silent sound to fully unlock audio playback on iOS/Android
-  const silent = new Audio('data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tUAAAAAAABLhQAAAgAAA0gAAABAAADSAAAACAAAA0gAAABMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV');
-  silent.volume = 0.01;
-  silent.play().catch(()=>{});
-  if(pendingSpeech){ const t=pendingSpeech; pendingSpeech=null; speakReply(t); }
-}
-
-document.addEventListener('click', unlockAudio);
-document.addEventListener('touchstart', unlockAudio, {passive:true});
+document.addEventListener('click', ()=>{
+  if(!audioUnlocked){
+    audioUnlocked = true;
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    ctx.resume().then(()=> ctx.close());
+    if(pendingSpeech){ const t=pendingSpeech; pendingSpeech=null; speakReply(t); }
+  }
+}, {once: false});
 
 async function speakReply(text){
   if(!audioUnlocked){ pendingSpeech=text; setMode('idle'); setTimeout(startWakeWord,1000); return; }
   setMode('speaking');
   try {
-    const body = {
-      input: { text: text },
-      voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-D', ssmlGender: 'MALE' },
-      audioConfig: { audioEncoding: 'MP3', speakingRate: 0.92, pitch: -2 }
-    };
-    const res = await fetch(
-      'https://texttospeech.googleapis.com/v1/text:synthesize?key='+GOOGLE_STT_KEY,
-      { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }
-    );
+    const res = await fetch(BACKEND_URL + '/speak', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text: text })
+    });
     const data = await res.json();
-    if(data.error){ throw new Error(data.error.message); }
-    const audio = new Audio('data:audio/mp3;base64,'+data.audioContent);
+    if(data.detail || data.error){ throw new Error(data.detail || data.error); }
+    const audio = new Audio('data:audio/mp3;base64,'+data.audio);
     audio.onended = ()=>{ setMode('idle'); setTimeout(startWakeWord, 1000); };
     audio.onerror = ()=>{ setMode('idle'); setTimeout(startWakeWord, 1000); };
     await audio.play();
@@ -581,18 +570,14 @@ async function speakReply(text){
 async function speakAck(text){
   if(!audioUnlocked) return;
   try {
-    const body = {
-      input: { text: text },
-      voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-D', ssmlGender: 'MALE' },
-      audioConfig: { audioEncoding: 'MP3', speakingRate: 1.0, pitch: -2 }
-    };
-    const res = await fetch(
-      'https://texttospeech.googleapis.com/v1/text:synthesize?key='+GOOGLE_STT_KEY,
-      { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }
-    );
+    const res = await fetch(BACKEND_URL + '/speak', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text: text })
+    });
     const data = await res.json();
-    if(data.audioContent){
-      const audio = new Audio('data:audio/mp3;base64,'+data.audioContent);
+    if(data.audio){
+      const audio = new Audio('data:audio/mp3;base64,'+data.audio);
       await audio.play();
     }
   } catch(e) { console.error('Ack TTS error:', e); }
@@ -622,7 +607,8 @@ function textSend(){
 }
 
 document.addEventListener('gesturestart',e=>e.preventDefault());
-
+speechSynthesis?.getVoices();
+if(window.speechSynthesis) speechSynthesis.onvoiceschanged=()=>speechSynthesis.getVoices();
 </script>
 </body>
 </html>
