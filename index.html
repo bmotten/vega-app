@@ -432,7 +432,7 @@ function startListening(){
     callVega(transcript);
   };
   recognition.onend=()=>{ stopMic(); if(mode==='listening'){ setMode('idle'); showResp('Awaiting your command.',false); } };
-  recognition.onerror=e=>{ stopMic(); setMode('idle'); if(e.error!=='no-speech') showResp('Voice error — try again or type below.',false); };
+  recognition.onerror=e=>{ stopMic(); setMode('idle'); if(e.error!=='no-speech') showResp('Voice error ('+e.error+') — try again or type below.',false); };
   recognition.start();
 }
 
@@ -470,21 +470,59 @@ async function callVega(text){
 
 // ── SPEECH SYNTHESIS ─────────────────────────────────────
 async function speakReply(text){
+  setMode('speaking');
   try {
-    setMode('speaking');
     const res = await fetch(BACKEND_URL + '/speak', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ text: text })
     });
+
+    if(!res.ok){
+      const errText = await res.text();
+      console.error('TTS HTTP error:', res.status, errText);
+      showResp(text + ' [voice failed: ' + res.status + ']', true);
+      setMode('idle');
+      return;
+    }
+
     const data = await res.json();
-    if(data.detail || data.error){ throw new Error(data.detail || data.error); }
+    if(data.detail || data.error){
+      console.error('TTS API error:', data);
+      showResp(text + ' [voice failed: '+(data.detail||data.error)+']', true);
+      setMode('idle');
+      return;
+    }
+
+    if(!data.audio){
+      console.error('TTS returned no audio:', data);
+      showResp(text + ' [no audio returned]', true);
+      setMode('idle');
+      return;
+    }
+
     const audio = new Audio('data:audio/mp3;base64,' + data.audio);
     audio.onended = () => setMode('idle');
-    audio.onerror = () => setMode('idle');
-    await audio.play();
+    audio.onerror = (err) => {
+      console.error('Audio playback error:', err);
+      setMode('idle');
+    };
+    try {
+      await audio.play();
+    } catch(playErr) {
+      console.error('Audio play() failed:', playErr);
+      showResp(text + ' [click anywhere to enable audio]', true);
+      // Set up one-time click to retry
+      const retry = ()=>{
+        document.removeEventListener('click', retry);
+        audio.play().catch(()=>{});
+      };
+      document.addEventListener('click', retry);
+      setMode('idle');
+    }
   } catch(e){
     console.error('TTS error:', e);
+    showResp(text + ' [voice failed: '+e.message+']', true);
     setMode('idle');
   }
 }
