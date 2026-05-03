@@ -229,8 +229,8 @@ function setAgent(txt){
 }
 
 // ── MEDIARECORDER VOICE ───────────────────────────────────
-const SILENCE_THRESHOLD = 15;   // audio level below this = silence
-const SILENCE_TIMEOUT   = 1800; // ms of silence before auto-send
+const SILENCE_THRESHOLD = 8;   // audio level below this = silence
+const SILENCE_TIMEOUT   = 2000; // ms of silence before auto-send
 const MAX_RECORD_TIME   = 12000; // max recording ms before force-send
 
 function getSupportedMimeType(){
@@ -259,19 +259,23 @@ async function startRecording(){
     let maxTimer      = null;
     let watching      = true;
 
+    const recordStart = Date.now();
+    const MIN_RECORD_MS = 800;
+    let maxLevel = 0;
+
     function checkSilence(){
       if(!watching) return;
       analyser.getByteFrequencyData(dataArray);
       const avg = dataArray.reduce((a,b)=>a+b,0) / dataArray.length;
+      if(avg > maxLevel) maxLevel = avg;
 
-      // Debug: show audio level
-      document.getElementById('agent-badge').textContent = 'level: '+Math.round(avg);
+      document.getElementById('agent-badge').textContent = 'level ' + Math.round(avg) + ' • peak ' + Math.round(maxLevel);
 
       if(avg > SILENCE_THRESHOLD){
         hasSpoken    = true;
         silenceStart = null;
         updateSilenceBar(avg);
-      } else if(hasSpoken){
+      } else if(hasSpoken && (Date.now() - recordStart) > MIN_RECORD_MS){
         if(!silenceStart) silenceStart = Date.now();
         const silentFor = Date.now() - silenceStart;
         const pct = Math.min(100, Math.round(silentFor / SILENCE_TIMEOUT * 100));
@@ -422,13 +426,21 @@ function startWakeWord(){
       .map(r => r[0].transcript.toLowerCase())
       .join(' ');
 
-    // Show what was heard for debugging
-    showResp('Heard: "' + heard.trim() + '"', false);
+    // Visual feedback: dim hint of what's being heard
+    if(heard.trim()) document.getElementById('state-lbl').textContent = '… ' + heard.trim().slice(-40);
 
-    if(heard.includes('hey vega') || heard.includes('hey vegas') ||
-       heard.includes('a vega') || heard.includes('aveda') ||
-       heard.includes('vega') || heard.includes('bega') || heard.includes('mega')){
-      wakeRecognition.stop();
+    const wakeWords = [
+      'hey vega', 'hey vegas', 'hey vegan', 'hey baga', 'hey beggar',
+      'hey mega', 'hey beg', 'hey vegga', 'hey vita', 'hey veiga',
+      'a vega', 'aveda', 'avega', 'okay vega',
+      'vega', 'mega', 'baga', 'vegan'
+    ];
+
+    const matched = wakeWords.some(w => heard.toLowerCase().trim().includes(w));
+
+    if(matched){
+      console.log('Wake word matched in:', heard);
+      try { wakeRecognition.stop(); } catch(_){}
       wakeActive = false;
       pulseWake();
       setTimeout(()=> startRecording(), 600);
