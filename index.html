@@ -412,28 +412,139 @@ function stopMic(){
 
 // ── VOICE INPUT ───────────────────────────────────────────
 function handleTap(){
-  if(mode==='speaking'){ speechSynthesis.cancel(); setMode('idle'); return; }
-  if(mode==='listening'){ recognition?.stop(); return; }
+  if(mode==='speaking'){ setMode('idle'); return; }
+  if(mode==='listening'){ stopRecording(); return; }
   if(mode==='thinking') return;
-  startListening();
+  startRecording();
 }
 
-function startListening(){
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){ showResp('Voice unavailable — use Chrome or type below.',false); return; }
-  recognition=new SR();
-  recognition.lang='en-US'; recognition.continuous=false; recognition.interimResults=false;
-  recognition.onstart=async()=>{ setMode('listening'); showResp('Listening...',false); await startMic(); };
-  recognition.onresult=e=>{
-    const transcript = e.results[0][0].transcript;
-    recognition.stop();
-    stopMic();
-    showResp(transcript, false);
-    callVega(transcript);
-  };
-  recognition.onend=()=>{ stopMic(); if(mode==='listening'){ setMode('idle'); showResp('Awaiting your command.',false); } };
-  recognition.onerror=e=>{ stopMic(); setMode('idle'); if(e.error!=='no-speech') showResp('Voice error ('+e.error+') — try again or type below.',false); };
-  recognition.start();
+let mediaRecorder = null;
+let audioChunks = [];
+
+function getSupportedMimeType(){
+  const types = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4',''];
+  for(const t of types){ if(!t || MediaRecorder.isTypeSupported(t)) return t; }
+  return '';
+}
+
+async function startRecording(){
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+    audioChunks = [];
+
+    const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    const SILENCE_THRESHOLD = 15;
+    const SILENCE_TIMEOUT = 1800;
+    const MAX_RECORD_TIME = 12000;
+    let silenceStart = null;
+    let hasSpoken = false;
+    let watching = true;
+
+    function checkSilence(){
+      if(!watching) return;
+      analyser.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a,b)=>a+b,0) / dataArray.length;
+      if(avg > SILENCE_THRESHOLD){
+        hasSpoken = true;
+        silenceStart = null;
+      } else if(hasSpoken){
+        if(!silenceStart) silenceStart = Date.now();
+        if(Date.now() - silenceStart >= SILENCE_TIMEOUT){
+          watching = false;
+          if(mediaRecorder && mediaRecorder.state !== 'inactive'){
+            setMode('thinking');
+            showResp('Processing...', false);
+            mediaRecorder.stop();
+          }
+          return;
+        }
+      }
+      requestAnimationFrame(checkSilence);
+    }
+
+    setTimeout(()=>{
+      if(watching && mediaRecorder && mediaRecorder.state !== 'inactive'){
+        watching = false;
+        setMode('thinking');
+        showResp('Processing...', false);
+        mediaRecorder.stop();
+      }
+    }, MAX_RECORD_TIME);
+
+    const mimeType = getSupportedMimeType();
+    mediaRecorder = mimeType
+      ? new MediaRecorder(stream, {mimeType})
+      : new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = e => { if(e.data && e.data.size>0) audioChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t=>t.stop());
+      audioCtx.close().catch(()=>{});
+      transcribeAudio();
+    };
+    mediaRecorder.start(100);
+    setMode('listening');
+    showResp('Listening...', false);
+    requestAnimationFrame(checkSilence);
+
+  } catch(e){
+    setMode('idle');
+    showResp('Mic error: '+e.message, false);
+  }
+}
+
+function stopRecording(){
+  if(mediaRecorder && mediaRecorder.state !== 'inactive'){
+    setMode('thinking');
+    showResp('Processing...', false);
+    mediaRecorder.stop();
+  }
+}
+
+async function transcribeAudio(){
+  try {
+    if(!audioChunks.length){ setMode('idle'); showResp('No audio captured.', false); return; }
+    const mimeType = mediaRecorder.mimeType || 'audio/webm';
+    const blob = new Blob(audioChunks, {type: mimeType});
+    const base64 = await blobToBase64(blob);
+    const res = await fetch(BACKEND_URL + '/transcribe', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ audio: base64, mimeType: mimeType })
+    });
+    const data = await res.json();
+    if(data.detail || data.error){
+      setMode('idle');
+      showResp('STT error: '+(data.detail||data.error), false);
+      return;
+    }
+    const transcript = data?.transcript?.trim();
+    if(transcript && transcript.length > 0){
+      showResp(transcript, false);
+      callVega(transcript);
+    } else {
+      setMode('idle');
+      showResp('No speech detected — tap mic and try again.', false);
+    }
+  } catch(e){
+    setMode('idle');
+    showResp('Transcription error: '+e.message, false);
+    console.error(e);
+  }
+}
+
+function blobToBase64(blob){
+  return new Promise((resolve,reject)=>{
+    const r = new FileReader();
+    r.onloadend = ()=> resolve(r.result.split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
 }
 
 // ── CALL BACKEND ─────────────────────────────────────────
